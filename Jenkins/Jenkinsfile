@@ -1,0 +1,124 @@
+pipeline {
+    agent any
+
+    environment {
+        KUBECONFIG = '/var/lib/jenkins/.kube/config'
+        IMAGE_NAME = 'python-app'            
+        CONTAINER_PORT = '5000'              
+        HOST_PORT = '5001'                   
+        DOCKER_REGISTRY = 'docker.io/cchahi'  // Replace with your Docker Hub username
+        DOCKER_TAG = 'latest.${BUILD_NUMBER}'                
+        ANSIBLE_PLAYBOOK = 'deploy.yml'      
+        SSH_KEY = '/var/lib/jenkins/.ssh/jen-ssh-key.txt'
+        K8S_MANIFEST_PATH = 'k8s'   // Path to your Kubernetes manifests
+        DEPLOYMENT_NAME = 'python-app'
+        CONTAINER_NAME = 'python-app-container'
+    }
+
+    stages {
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main', url: 'https://github.com/cchahid/python-app.git'
+            }
+        }
+
+        stage('SSH Command') {
+            steps {
+                script {
+                    sh "ssh -i /var/lib/jenkins/.ssh/jenkins_rsa -o StrictHostKeyChecking=no azureuser@172.201.196.66 echo Hello World"
+
+                }
+            }
+        }
+
+        stage('Install Dependencies') {
+            steps {
+                dir('src') {
+                    script {
+                        sh '''
+                        set -e
+                        sudo apt-get update
+                        python3.12 -m venv myenv  # Create virtual environment called 'myenv'
+                        . myenv/bin/activate # Activate the virtual environment
+                        pip install -r requirements.txt  # Install dependencies
+                        '''
+                    }
+                }
+            }
+        }
+
+
+        stage('Run Unit Tests') {
+            steps {
+                script {
+                    sh '''
+                        set -e
+                        cd src
+                        . myenv/bin/activate  # Use dot instead of source for compatibility
+                        pip install --upgrade pytest
+                        pytest
+                    '''
+
+                }
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    sh '''
+                        set -e
+                        TAG="latest.${BUILD_NUMBER}"
+                        docker build --no-cache -t ${DOCKER_REGISTRY}/${IMAGE_NAME}:${TAG} -f build/Dockerfile .
+                    '''
+                }
+            }
+        }
+
+        stage('Push Docker Image to Docker Hub') {
+            steps {
+                script {
+                    withCredentials([usernamePassword(credentialsId: 'docker-hub-credentials', usernameVariable: 'DOCKER_USER', passwordVariable: 'DOCKER_PASS')]) {
+                        sh '''
+                            echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                            TAG="latest.${BUILD_NUMBER}"
+                            docker push docker.io/cchahi/python-app:$TAG
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Deploy to Azure Kubernetes') {
+            steps {
+                script {
+                    // Met à jour la version de l'image dans le fichier de déploiement
+                     sh '''
+                        # Utilise sed pour mettre à jour l'image dans le fichier de déploiement
+                        sed -i "s|image: ${DOCKER_REGISTRY}/${IMAGE_NAME}:.*|image: ${DOCKER_REGISTRY}/${IMAGE_NAME}:latest.${BUILD_NUMBER}|g" ${K8S_MANIFEST_PATH}/python-app-deployment.yaml
+                        
+                        # Configure kubectl avec le fichier kubeconfig
+                        export KUBECONFIG=/etc/rancher/k3s/k3s.yaml
+                        
+                        # Affiche la configuration actuelle
+                        kubectl config view
+                        
+                        # Applique les manifests Kubernetes
+                        kubectl apply -f ${K8S_MANIFEST_PATH}/python-app-deployment.yaml
+                        kubectl apply -f ${K8S_MANIFEST_PATH}/python-app-service.yaml
+                    '''
+                }
+            }
+        }
+        
+
+    }
+
+    post {
+        always {
+            sh 'docker system prune -f'
+        }
+    }
+}
+
+
